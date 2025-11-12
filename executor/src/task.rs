@@ -16,9 +16,29 @@ use smoldot::{
     },
 };
 use std::collections::BTreeMap;
+use std::io::Read;
 use wasm_bindgen::prelude::*;
 
 const LOG_TARGET: &str = "chopsticks::executor";
+
+/// Detects if wasm is zstd-compressed and decompresses it if needed
+fn maybe_decompress_wasm(wasm: &[u8]) -> Result<Vec<u8>, String> {
+    // Check for zstd magic number (0x28, 0xB5, 0x2F, 0xFD)
+    if wasm.len() >= 4 && &wasm[0..4] == &[0x28, 0xB5, 0x2F, 0xFD] {
+        log::debug!(target: LOG_TARGET, "Detected zstd-compressed wasm, decompressing...");
+        let mut decoder = zstd::Decoder::new(wasm)
+            .map_err(|e| format!("Failed to create zstd decoder: {}", e))?;
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| format!("Failed to decompress wasm: {}", e))?;
+        log::debug!(target: LOG_TARGET, "Decompressed wasm from {} bytes to {} bytes", wasm.len(), decompressed.len());
+        Ok(decompressed)
+    } else {
+        // Already uncompressed, return as-is
+        Ok(wasm.to_vec())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,8 +159,14 @@ pub async fn run_task(task: TaskCall, js: crate::JsCallback) -> Result<TaskRespo
     let mut storage_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = Default::default();
     let mut offchain_storage_changes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = Default::default();
 
+    // Decompress wasm if needed
+    let wasm = match maybe_decompress_wasm(&task.wasm.0) {
+        Ok(wasm) => wasm,
+        Err(e) => return Ok(TaskResponse::Error(format!("Failed to decompress wasm: {}", e))),
+    };
+
     let vm_proto = match HostVmPrototype::new(Config {
-        module: &task.wasm,
+        module: &wasm,
         heap_pages: HeapPages::from(2048),
         exec_hint: smoldot::executor::vm::ExecHint::ValidateAndExecuteOnce,
         allow_unresolved_imports: task.allow_unresolved_imports,
@@ -430,8 +456,12 @@ pub async fn run_task(task: TaskCall, js: crate::JsCallback) -> Result<TaskRespo
 }
 
 pub async fn runtime_version(wasm: HexString) -> Result<RuntimeVersion, JsError> {
+    // Decompress wasm if needed (handles zstd-compressed runtime wasm)
+    let wasm_bytes = maybe_decompress_wasm(&wasm.0)
+        .map_err(|e| JsError::new(&format!("Failed to decompress wasm: {}", e)))?;
+
     let vm_proto = HostVmPrototype::new(Config {
-        module: &wasm,
+        module: &wasm_bytes,
         heap_pages: HeapPages::from(2048),
         exec_hint: smoldot::executor::vm::ExecHint::ValidateAndExecuteOnce,
         allow_unresolved_imports: true,
